@@ -1,26 +1,72 @@
 import streamlit as st
-from dotenv import load_dotenv
-from PyPDF2 import PdfReader
+import pdfplumber
+from langchain.embeddings import OpenAIEmbeddings
 from langchain.text_splitter import CharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings, HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.chat_models import ChatOpenAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from htmlTemplates import css, bot_template, user_template
-from langchain import HuggingFacePipeline
-from langchain.llms import LlamaCpp
+from sqlalchemy import create_engine, Table, Column, Integer, String, MetaData
+from sqlalchemy.orm import sessionmaker
+import mysql.connector
+from credentials import DB_USER, DB_PASSWORD, DB_HOST, DB_NAME  # Import from credentials.py
+
+from dotenv import load_dotenv
+import os
+
+# ****** using free embedding ******
+import gensim
+from gensim.models.doc2vec import Doc2Vec, TaggedDocument
+
+# Load environment variables from the .env file
+load_dotenv('environment.env')
+
+# Retrieve the OpenAI API key from the environment
+openai_api_key = os.getenv('OPENAI_API_KEY')
+
+# Check if the key is loaded properly (you can remove this later)
+if openai_api_key is None:
+    raise ValueError("OpenAI API key not found. Make sure the .env file is correctly loaded.")
 
 
-def get_pdf_text(pdf_docs):
+# You don’t need to load environment variables since you’re using credentials.py
+# Database connection configuration
+DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
+
+# SQLAlchemy setup for connecting to MySQL
+engine = create_engine(DATABASE_URL)
+Session = sessionmaker(bind=engine)
+session = Session()
+
+# Metadata to manage tables
+metadata = MetaData()
+
+# Define the table for storing text chunks and embeddings
+text_embeddings_table = Table('text_embeddings', metadata,
+                              Column('id', Integer, primary_key=True, autoincrement=True),
+                              Column('text_chunk', String(2000)),
+                              Column('embedding', String(4000)))
+
+# Create the table if it doesn't exist
+metadata.create_all(engine)
+
+# Function to extract text from two-column PDFs, ignoring images
+def get_pdf_text(pdf_file):
     text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
+    with pdfplumber.open(pdf_file) as pdf_reader:
         for page in pdf_reader.pages:
-            text += page.extract_text()
+            # Extract text column-wise (two-column layout)
+            left_bbox = (0, 0, page.width / 2, page.height)
+            right_bbox = (page.width / 2, 0, page.width, page.height)
+
+            # Extract text from left and right columns
+            left_text = page.within_bbox(left_bbox).extract_text()
+            right_text = page.within_bbox(right_bbox).extract_text()
+
+            # Combine text from both columns
+            if left_text:
+                text += left_text
+            if right_text:
+                text += right_text
     return text
 
-
+# Function to split text into 500 character chunks
 def get_text_chunks(text):
     text_splitter = CharacterTextSplitter(
         separator="\n",
@@ -32,83 +78,73 @@ def get_text_chunks(text):
     return chunks
 
 
-def get_vectorstore(text_chunks):
-    embeddings = OpenAIEmbeddings()
-    # embeddings = HuggingFaceEmbeddings(
-    #     model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
-    return vectorstore
+# Prepare the data
+def get_tagged_documents(text_chunks):
+    tagged_documents = [TaggedDocument(words=chunk.split(), tags=[str(i)]) for i, chunk in enumerate(text_chunks)]
+    return tagged_documents
 
+# Train a Doc2Vec model
+def train_doc2vec_model(text_chunks):
+    tagged_documents = get_tagged_documents(text_chunks)
+    model = Doc2Vec(vector_size=100, window=2, min_count=1, workers=4, epochs=40)
+    model.build_vocab(tagged_documents)
+    model.train(tagged_documents, total_examples=model.corpus_count, epochs=model.epochs)
+    return model
 
-def get_conversation_chain(vectorstore):
-    llm = ChatOpenAI()
-    # llm = HuggingFacePipeline.from_model_id(
-    #     model_id="lmsys/vicuna-7b-v1.3",
-    #     task="text-generation",
-    #     model_kwargs={"temperature": 0.01},
-    # )
-    # llm = LlamaCpp(
-    #     model_path="models/llama-2-7b-chat.ggmlv3.q4_1.bin",  n_ctx=1024, n_batch=512)
+# Function to store embeddings into the MySQL database
+def vectorize_and_store(text_chunks):
+    # embeddings = OpenAIEmbeddings(openai_api_key=openai_api_key)
+    model = train_doc2vec_model(text_chunks)
 
-    memory = ConversationBufferMemory(
-        memory_key='chat_history', return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(
-            search_type="similarity", search_kwargs={"k": 4}),
-        memory=memory,
+    connection = mysql.connector.connect(
+        user=DB_USER,
+        password=DB_PASSWORD,
+        host=DB_HOST,
+        database=DB_NAME
     )
-    return conversation_chain
+    cursor = connection.cursor()
 
+    # for chunk in text_chunks:
+    #     # Get the embedding vector for the text chunk
+    #     vector = embeddings.embed_query(chunk)
+    #     vector_str = str(vector)  # Convert vector to string for database storage
+    for i, chunk in enumerate(text_chunks):
+        # Get the vector for the chunk
+        vector = model.infer_vector(chunk.split())
+        vector_str = str(vector.tolist())  # Convert vector to a list and store as string
 
-def handle_userinput(user_question):
-    response = st.session_state.conversation({'question': user_question})
-    st.session_state.chat_history = response['chat_history']
+        # Insert the text chunk and its vector into the database
+        query = """
+        INSERT INTO text_embeddings (text_chunk, embedding)
+        VALUES (%s, %s)
+        """
+        cursor.execute(query, (chunk, vector_str))
+        connection.commit()
 
-    for i, message in enumerate(st.session_state.chat_history):
-        if i % 2 == 0:
-            st.write(user_template.replace(
-                "{{MSG}}", message.content), unsafe_allow_html=True)
-        else:
-            st.write(bot_template.replace(
-                "{{MSG}}", message.content), unsafe_allow_html=True)
+    cursor.close()
+    connection.close()
 
-
+# Streamlit App
 def main():
-    load_dotenv()
-    st.set_page_config(page_title="Chat with PDFs",
-                       page_icon=":robot_face:")
-    st.write(css, unsafe_allow_html=True)
+    st.set_page_config(page_title="PDF Embedding Processor", page_icon=":robot_face:")
 
-    if "conversation" not in st.session_state:
-        st.session_state.conversation = None
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = None
+    st.header("Upload and Process PDFs")
 
-    st.header("Chat with PDFs :robot_face:")
-    user_question = st.text_input("Ask questions about your documents:")
-    if user_question:
-        handle_userinput(user_question)
+    # File uploader for PDFs
+    pdf_file = st.file_uploader("Upload your PDF file", type=['pdf'])
 
-    with st.sidebar:
-        st.subheader("Your documents")
-        pdf_docs = st.file_uploader(
-            "Upload your PDFs here and click on 'Process'", accept_multiple_files=True)
-        if st.button("Process"):
-            with st.spinner("Processing"):
-                # get pdf text
-                raw_text = get_pdf_text(pdf_docs)
+    if pdf_file is not None:
+        with st.spinner("Extracting text from PDF..."):
+            # Step 1: Extract text from the PDF file
+            raw_text = get_pdf_text(pdf_file)
 
-                # get the text chunks
-                text_chunks = get_text_chunks(raw_text)
+            # Step 2: Split the text into chunks of 500 characters
+            text_chunks = get_text_chunks(raw_text)
 
-                # create vector store
-                vectorstore = get_vectorstore(text_chunks)
+            # Step 3: Vectorize and store the chunks in the database
+            vectorize_and_store(text_chunks)
 
-                # create conversation chain
-                st.session_state.conversation = get_conversation_chain(
-                    vectorstore)
-
+            st.success("Text has been extracted, vectorized, and stored successfully!")
 
 if __name__ == '__main__':
     main()
