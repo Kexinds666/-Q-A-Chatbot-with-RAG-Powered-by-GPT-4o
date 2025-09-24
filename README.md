@@ -1,4 +1,4 @@
-# Production-Ready RAG-Powered Q&A Chatbot
+# RAG-Powered Q&A Chatbot
 
 A high-performance, full-stack RAG-powered intelligent Q&A chatbot built with modern technologies.
 
