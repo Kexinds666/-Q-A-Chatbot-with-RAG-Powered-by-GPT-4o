@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 # Set environment variables
-os.environ["OPENAI_API_KEY"] = "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"
+os.environ["OPENAI_API_KEY"] = OPENAI_API_KEY
 os.environ["SECRET_KEY"] = "test-secret-key"
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite:///./test.db"
 os.environ["REDIS_URL"] = "redis://localhost:6379"
